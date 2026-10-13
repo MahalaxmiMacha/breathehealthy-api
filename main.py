@@ -402,13 +402,18 @@ def explain(request: ExplainRequest):
             ),
         }
 
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("SHAP calculation failed.")
+        except Exception as exc:
+        logger.exception(
+            "SHAP calculation failed: %s: %s",
+            type(exc).__name__,
+            str(exc),
+        )
         raise HTTPException(
             status_code=503,
-            detail="SHAP explanation failed. The AQI prediction is separate.",
+            detail=(
+                f"SHAP explanation failed ({type(exc).__name__}). "
+                "The AQI prediction is still available."
+            ),
         )
     finally:
         # Release request-specific explanation objects.

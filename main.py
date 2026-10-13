@@ -1,7 +1,7 @@
 
 import os
 
-# Set limits before numerical/ML imports.
+# Limit CPU thread usage on the free Render instance.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
 os.environ["TF_NUM_INTEROP_THREADS"] = "1"
@@ -13,396 +13,422 @@ import gc
 import json
 import logging
 import threading
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
 import tensorflow as tf
 import xgboost as xgb
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# -------------------------------------------------------------------
+# Application configuration
+# -------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("breathehealthy")
 
-try:
-    tf.config.threading.set_intra_op_parallelism_threads(1)
-    tf.config.threading.set_inter_op_parallelism_threads(1)
-except Exception:
-    logger.warning("Could not set TensorFlow thread limits.")
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = BASE_DIR / "models"
+
+SEQUENCE_LENGTH = 24
+EXPECTED_FEATURE_COUNT = 33
+SHAP_TOP_COUNT = 10
 
 app = FastAPI(
-    title="BreatheHealthy AI API",
-    description="Hybrid LSTM + XGBoost Air Quality Forecasting API",
-    version="1.2.0",
+    title="BreatheHealthy API",
+    description="Hybrid air-quality forecasting and explainability API",
+    version="1.0.0",
 )
 
+# Allow frontend requests. Restrict origins to your frontend domain
+# if you later need stricter production CORS settings.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://breathe-wise-predict.base44.app",
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ],
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, "models")
-
-LSTM_PATH = os.path.join(MODEL_DIR, "lstm_model_final.keras")
-XGB_PATH = os.path.join(MODEL_DIR, "xgb_model.json")
-SCALER_PATH = os.path.join(MODEL_DIR, "scaler_final.pkl")
-META_PATH = os.path.join(MODEL_DIR, "meta_model_final.pkl")
-FEATURES_PATH = os.path.join(MODEL_DIR, "features_final.json")
-
-SEQ_LEN = 24
-
-# Only one SHAP calculation at a time.
-shap_lock = threading.Lock()
+# -------------------------------------------------------------------
+# Load the already-trained models. Do not retrain them here.
+# -------------------------------------------------------------------
 
 logger.info("Loading BreatheHealthy models...")
 
-required_files = [
-    LSTM_PATH,
-    XGB_PATH,
-    SCALER_PATH,
-    META_PATH,
-    FEATURES_PATH,
-]
-
-missing_files = [
-    path for path in required_files if not os.path.isfile(path)
-]
-
-if missing_files:
-    raise RuntimeError(
-        "Missing model files: "
-        + ", ".join(os.path.basename(p) for p in missing_files)
+try:
+    lstm_model = tf.keras.models.load_model(
+        MODEL_DIR / "lstm_model_final.keras",
+        compile=False,
     )
 
-# Load each trained model once.
-lstm_model = tf.keras.models.load_model(
-    LSTM_PATH, compile=False
-)
+    xgb_model = xgb.XGBRegressor()
+    xgb_model.load_model(str(MODEL_DIR / "xgb_model.json"))
 
-xgb_model = xgb.XGBRegressor()
-xgb_model.load_model(XGB_PATH)
-xgb_model.set_params(n_jobs=1)
+    scaler = joblib.load(MODEL_DIR / "scaler_final.pkl")
+    meta_model = joblib.load(MODEL_DIR / "meta_model_final.pkl")
 
-scaler = joblib.load(SCALER_PATH)
-meta_model = joblib.load(META_PATH)
+    with open(MODEL_DIR / "features_final.json", "r", encoding="utf-8") as f:
+        features = json.load(f)
 
-with open(FEATURES_PATH, "r", encoding="utf-8") as f:
-    feature_data = json.load(f)
+    if isinstance(features, dict):
+        # Supports JSON saved as {"features": [...]}.
+        features = features.get("features", features.get("feature_names"))
 
-FEATURES = (
-    feature_data.get("features", feature_data.get("FEATURES"))
-    if isinstance(feature_data, dict)
-    else feature_data
-)
+    if not isinstance(features, list):
+        raise ValueError(
+            "features_final.json must contain a list of feature names."
+        )
 
-if not isinstance(FEATURES, list) or not FEATURES:
-    raise RuntimeError("Invalid features_final.json.")
+    features = [str(name) for name in features]
 
-if (
-    not all(isinstance(x, str) and x for x in FEATURES)
-    or len(set(FEATURES)) != len(FEATURES)
-):
-    raise RuntimeError("Invalid or duplicate feature names.")
+    if len(features) != EXPECTED_FEATURE_COUNT:
+        raise ValueError(
+            f"Expected {EXPECTED_FEATURE_COUNT} features, "
+            f"but features_final.json contains {len(features)}."
+        )
 
-NUM_FEATURES = len(FEATURES)
+    if len(set(features)) != len(features):
+        raise ValueError("features_final.json contains duplicate feature names.")
 
-scaler_count = getattr(scaler, "n_features_in_", None)
-if scaler_count is not None and scaler_count != NUM_FEATURES:
-    raise RuntimeError("Scaler and feature-list sizes do not match.")
+    logger.info(
+        "Models loaded. Features=%d, sequence=%d",
+        len(features),
+        SEQUENCE_LENGTH,
+    )
 
-logger.info("Models loaded. Features=%s, sequence=%s",
-            NUM_FEATURES, SEQ_LEN)
+except Exception:
+    logger.exception("Failed to load one or more model files.")
+    raise
 
+# Only one SHAP request may run at a time on this small instance.
+shap_lock = threading.Lock()
+shap_explainer = None
+
+# -------------------------------------------------------------------
+# Request models
+# -------------------------------------------------------------------
 
 class PredictionRequest(BaseModel):
-    records: List[Dict[str, Any]] = Field(
-        ..., min_length=SEQ_LEN, max_length=SEQ_LEN
+    records: list[dict[str, Any]] = Field(
+        ...,
+        min_length=SEQUENCE_LENGTH,
+        max_length=SEQUENCE_LENGTH,
+        description="Exactly 24 chronological records containing model features",
     )
 
 
-# /explain accepts one row from Base44, or 24 rows from older clients.
 class ExplainRequest(BaseModel):
-    records: List[Dict[str, Any]] = Field(
-        ..., min_length=1, max_length=SEQ_LEN
+    records: list[dict[str, Any]] = Field(
+        ...,
+        min_length=1,
+        max_length=SEQUENCE_LENGTH,
+        description="One to 24 records containing model features",
     )
 
 
-def get_aqi_category(aqi: float) -> str:
-    if aqi <= 50:
-        return "Good"
-    if aqi <= 100:
-        return "Moderate"
-    if aqi <= 150:
-        return "Unhealthy for Sensitive Groups"
-    if aqi <= 200:
-        return "Unhealthy"
-    if aqi <= 300:
-        return "Very Unhealthy"
-    return "Hazardous"
+# -------------------------------------------------------------------
+# Data preparation
+# -------------------------------------------------------------------
 
-
-def prepare_row(record: Dict[str, Any], index: int = 0) -> np.ndarray:
+def prepare_row(record: dict[str, Any]) -> np.ndarray:
+    """Convert one record into the exact feature order used for training."""
     values = []
 
-    for feature in FEATURES:
+    for feature in features:
         if feature not in record:
             raise HTTPException(
-                status_code=400,
-                detail=f"Record {index} is missing '{feature}'.",
+                status_code=422,
+                detail=f"Missing required feature: {feature}",
             )
 
         try:
             value = float(record[feature])
-        except (TypeError, ValueError, OverflowError):
+        except (TypeError, ValueError):
             raise HTTPException(
-                status_code=400,
+                status_code=422,
                 detail=f"Feature '{feature}' must be numeric.",
             )
 
         if not np.isfinite(value):
             raise HTTPException(
-                status_code=400,
-                detail=f"Feature '{feature}' must be finite.",
+                status_code=422,
+                detail=f"Feature '{feature}' must be a finite number.",
             )
 
         values.append(value)
 
-    return np.asarray([values], dtype=np.float32)
+    return np.asarray(values, dtype=np.float32)
 
 
-def prepare_records(records: List[Dict[str, Any]]) -> np.ndarray:
-    if len(records) != SEQ_LEN:
+def prepare_records(records: list[dict[str, Any]]) -> np.ndarray:
+    """Convert records to a 2-D array in the trained feature order."""
+    if not records:
+        raise HTTPException(status_code=422, detail="No records were provided.")
+
+    rows = [prepare_row(record) for record in records]
+    matrix = np.stack(rows, axis=0)
+
+    if matrix.shape[1] != EXPECTED_FEATURE_COUNT:
         raise HTTPException(
-            status_code=400,
-            detail=f"Exactly {SEQ_LEN} hourly records are required.",
+            status_code=422,
+            detail=f"Expected {EXPECTED_FEATURE_COUNT} features per record.",
         )
 
-    return np.concatenate(
-        [prepare_row(record, i) for i, record in enumerate(records)],
-        axis=0,
-    )
+    return matrix
 
 
-def scale_matrix(X_raw: np.ndarray) -> np.ndarray:
+def scale_matrix(matrix: np.ndarray) -> np.ndarray:
+    """Apply the existing fitted scaler without fitting or retraining."""
     try:
-        X_scaled = np.asarray(
-            scaler.transform(X_raw), dtype=np.float32
-        )
-    except Exception:
+        scaled = scaler.transform(matrix)
+    except Exception as exc:
         logger.exception("Feature scaling failed.")
         raise HTTPException(
-            status_code=500, detail="Feature scaling failed."
+            status_code=422,
+            detail=f"Feature scaling failed: {type(exc).__name__}.",
         )
 
-    if (
-        X_scaled.shape != X_raw.shape
-        or not np.isfinite(X_scaled).all()
-    ):
+    scaled = np.asarray(scaled, dtype=np.float32)
+
+    if not np.isfinite(scaled).all():
+        raise HTTPException(
+            status_code=422,
+            detail="Scaled feature values contain invalid numbers.",
+        )
+
+    return scaled
+
+
+# -------------------------------------------------------------------
+# Hybrid prediction
+# -------------------------------------------------------------------
+
+def run_prediction(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run the existing LSTM + XGBoost + meta-model pipeline."""
+    raw_matrix = prepare_records(records)
+
+    if raw_matrix.shape[0] != SEQUENCE_LENGTH:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Prediction requires exactly {SEQUENCE_LENGTH} records.",
+        )
+
+    scaled_matrix = scale_matrix(raw_matrix)
+
+    # LSTM input shape: (batch, sequence length, feature count).
+    lstm_input = scaled_matrix.reshape(
+        1,
+        SEQUENCE_LENGTH,
+        EXPECTED_FEATURE_COUNT,
+    )
+
+    try:
+        lstm_output = np.asarray(
+            lstm_model.predict(lstm_input, verbose=0)
+        ).reshape(-1)
+
+        # XGBoost uses the most recent time step.
+        xgb_input = scaled_matrix[-1:, :]
+        xgb_output = np.asarray(
+            xgb_model.predict(xgb_input)
+        ).reshape(-1)
+
+        if lstm_output.size == 0 or xgb_output.size == 0:
+            raise ValueError("A model returned an empty prediction.")
+
+        lstm_prediction = float(lstm_output[0])
+        xgb_prediction = float(xgb_output[0])
+
+        # Meta-model combines the two base-model predictions.
+        meta_input = np.asarray(
+            [[lstm_prediction, xgb_prediction]],
+            dtype=np.float32,
+        )
+
+        final_output = np.asarray(
+            meta_model.predict(meta_input)
+        ).reshape(-1)
+
+        if final_output.size == 0:
+            raise ValueError("The meta-model returned an empty prediction.")
+
+        final_prediction = float(final_output[0])
+
+        if not np.isfinite(
+            [lstm_prediction, xgb_prediction, final_prediction]
+        ).all():
+            raise ValueError("A model returned a non-finite prediction.")
+
+        return {
+            "prediction": final_prediction,
+            "predicted_aqi": final_prediction,
+            "lstm_prediction": lstm_prediction,
+            "xgb_prediction": xgb_prediction,
+            "model": "LSTM + XGBoost + Meta-Learner",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Prediction failed.")
         raise HTTPException(
             status_code=500,
-            detail="Scaled input has invalid dimensions or values.",
+            detail=f"Prediction failed: {type(exc).__name__}.",
         )
+    finally:
+        gc.collect()
 
-    return X_scaled
 
-
-def run_prediction(X_scaled: np.ndarray) -> Dict[str, float]:
-    X_lstm = X_scaled.reshape(1, SEQ_LEN, NUM_FEATURES)
-
-    try:
-        output = lstm_model(X_lstm, training=False)
-        lstm_prediction = float(np.asarray(output).reshape(-1)[0])
-    except Exception:
-        logger.exception("LSTM inference failed.")
-        raise HTTPException(status_code=500, detail="LSTM prediction failed.")
-
-    X_latest = X_scaled[-1:].copy()
-
-    try:
-        xgb_prediction = float(xgb_model.predict(X_latest)[0])
-    except Exception:
-        logger.exception("XGBoost inference failed.")
-        raise HTTPException(status_code=500, detail="XGBoost prediction failed.")
-
-    try:
-        meta_input = np.asarray(
-            [[lstm_prediction, xgb_prediction]], dtype=np.float32
-        )
-        hybrid_prediction = float(meta_model.predict(meta_input)[0])
-    except Exception:
-        logger.exception("Hybrid inference failed.")
-        raise HTTPException(status_code=500, detail="Hybrid prediction failed.")
-
-    results = [lstm_prediction, xgb_prediction, hybrid_prediction]
-    if not all(np.isfinite(value) for value in results):
-        raise HTTPException(
-            status_code=500, detail="Model returned invalid predictions."
-        )
-
-    return {
-        "lstm_prediction": lstm_prediction,
-        "xgboost_prediction": xgb_prediction,
-        "hybrid_prediction": hybrid_prediction,
-    }
-
+# -------------------------------------------------------------------
+# Health check
+# -------------------------------------------------------------------
 
 @app.get("/")
 def root():
     return {
-        "service": "BreatheHealthy AI API",
+        "service": "BreatheHealthy API",
         "status": "online",
-        "message": "Hybrid LSTM + XGBoost AQI forecasting service",
         "docs": "/docs",
-        "health": "/health",
     }
 
 
 @app.get("/health")
 def health():
-    # IMPORTANT: Do not import SHAP here. Health checks can be frequent.
+    # Do not import SHAP here: health checks should remain lightweight.
     return {
-        "status": "online",
-        "service": "BreatheHealthy AI API",
-        "version": app.version,
+        "status": "healthy",
         "models": {
-            "xgboost": xgb_model is not None,
-            "lstm": lstm_model is not None,
-            "stacked_hybrid": meta_model is not None,
+            "lstm": "loaded",
+            "xgboost": "loaded",
+            "scaler": "loaded",
+            "meta_model": "loaded",
             "shap": "loaded on demand",
         },
-        "features": NUM_FEATURES,
-        "sequence_length": SEQ_LEN,
-        "prediction_target": "Next-hour US AQI",
-        "explanation_target": "XGBoost component only",
+        "features": len(features),
+        "sequence_length": SEQUENCE_LENGTH,
     }
 
+
+# -------------------------------------------------------------------
+# Prediction endpoint
+# -------------------------------------------------------------------
 
 @app.post("/predict")
 def predict(request: PredictionRequest):
-    # Keep the original 24-hour LSTM input contract.
-    X_raw = prepare_records(request.records)
-    X_scaled = scale_matrix(X_raw)
-    predictions = run_prediction(X_scaled)
+    return run_prediction(request.records)
 
-    hybrid = predictions["hybrid_prediction"]
 
-    return {
-        "success": True,
-        "prediction_target": "Next-hour US AQI",
-        "predicted_aqi": round(hybrid, 2),
-        "lstm_prediction": round(predictions["lstm_prediction"], 2),
-        "xgboost_prediction": round(predictions["xgboost_prediction"], 2),
-        "category": get_aqi_category(hybrid),
-        "input_hours": SEQ_LEN,
-        "features": NUM_FEATURES,
-    }
-
+# -------------------------------------------------------------------
+# SHAP explanation endpoint
+# -------------------------------------------------------------------
 
 @app.post("/explain")
 def explain(request: ExplainRequest):
-    # Do not run multiple memory-intensive explanations simultaneously.
+    global shap_explainer
+
+    # Never queue multiple memory-heavy SHAP requests on the free instance.
     if not shap_lock.acquire(blocking=False):
         raise HTTPException(
             status_code=503,
-            detail="SHAP explanation is busy. Please retry shortly.",
+            detail="SHAP explanation is busy. Please try again shortly.",
         )
 
-    X_raw = None
-    X_scaled = None
-    X_latest = None
-    explanation = None
     explainer = None
-    shap_module = None
+    shap_values = None
+    explanation = None
+    raw_matrix = None
+    scaled_matrix = None
+    xgb_input = None
+    values = None
+    base_value = None
 
     try:
-        # Accept a single row from Base44 or use the last row of 24.
-        latest_record = request.records[-1]
-        X_raw = prepare_row(latest_record)
-        X_scaled = scale_matrix(X_raw)
-        X_latest = X_scaled.copy()
+        # The frontend may send just the latest record.
+        raw_matrix = prepare_records(request.records)
+        scaled_matrix = scale_matrix(raw_matrix)
+        xgb_input = scaled_matrix[-1:, :]
 
-        # SHAP is imported only when someone requests an explanation.
-        try:
-            import shap as shap_module
-        except Exception:
-            logger.exception("SHAP import failed.")
-            raise HTTPException(
-                status_code=503,
-                detail="SHAP is temporarily unavailable.",
-            )
+        # Import SHAP only when an explanation is requested.
+        import shap
 
-        # Reuse the already-loaded XGBoost model. No second model copy,
-        # no background dataset, and only one explained observation.
-        explainer = shap_module.TreeExplainer(xgb_model)
-        explanation = explainer(X_latest)
+        if shap_explainer is None:
+            logger.info("Creating SHAP TreeExplainer on demand.")
+            shap_explainer = shap.TreeExplainer(xgb_model)
 
-        shap_values = np.asarray(explanation.values)
-        if shap_values.ndim == 3 and shap_values.shape[0] == 1:
-            shap_values = shap_values[0]
+        explainer = shap_explainer
+        explanation = explainer(xgb_input)
 
-        if shap_values.ndim == 2:
-            shap_row = shap_values[0]
-        elif shap_values.ndim == 1:
-            shap_row = shap_values
-        else:
+        values = np.asarray(explanation.values)
+
+        # Normalize common SHAP output shapes for one-row regression.
+        if values.ndim == 3:
+            values = values[0, :, 0]
+        elif values.ndim == 2:
+            values = values[0]
+
+        values = np.asarray(values).reshape(-1)
+
+        if values.size != len(features):
             raise ValueError(
-                f"Unexpected SHAP output shape: {shap_values.shape}"
+                f"SHAP returned {values.size} values for "
+                f"{len(features)} features."
             )
 
-        base_values = np.asarray(explanation.base_values).reshape(-1)
-        if base_values.size == 0:
-            raise ValueError("SHAP returned no base value.")
+        base_value = np.asarray(explanation.base_values).reshape(-1)
+        base = float(base_value[0]) if base_value.size else 0.0
 
-        base_value = float(base_values[0])
+        if not np.isfinite(values).all() or not np.isfinite(base):
+            raise ValueError("SHAP returned non-finite values.")
 
-        if (
-            len(shap_row) != NUM_FEATURES
-            or not np.isfinite(shap_row).all()
-            or not np.isfinite(base_value)
-        ):
-            raise ValueError("SHAP returned invalid values.")
+        # Report original feature values for readability.
+        latest_record = request.records[-1]
 
-        factors = []
-        for i, feature in enumerate(FEATURES):
-            contribution = float(shap_row[i])
-            factors.append({
-                "feature": feature,
-                "value": round(float(X_raw[0, i]), 4),
-                "shap_value": round(contribution, 6),
-                "impact": (
-                    "increases" if contribution > 0
-                    else "decreases" if contribution < 0
-                    else "neutral"
-                ),
-            })
+        factor_items = []
+        for index, feature in enumerate(features):
+            shap_value = float(values[index])
+            raw_value = float(raw_matrix[-1, index])
 
-        factors.sort(
-            key=lambda item: abs(item["shap_value"]), reverse=True
+            factor_items.append(
+                {
+                    "feature": feature,
+                    "value": raw_value,
+                    "shap_value": shap_value,
+                    "impact": (
+                        "increases prediction"
+                        if shap_value > 0
+                        else "decreases prediction"
+                        if shap_value < 0
+                        else "neutral"
+                    ),
+                }
+            )
+
+        factor_items.sort(
+            key=lambda item: abs(item["shap_value"]),
+            reverse=True,
         )
 
         return {
-            "success": True,
-            "explanation_target": "XGBoost component prediction",
-            "explanation_method": "SHAP TreeExplainer",
-            "base_value": round(base_value, 6),
-            "top_factors": factors[:10],
-            "total_features": NUM_FEATURES,
-            "note": (
-                "SHAP explains the XGBoost component, not the complete "
-                "LSTM plus meta-model hybrid prediction. Positive values "
-                "push the XGBoost output upward; negative values push it "
-                "downward."
-            ),
+            "status": "success",
+            "model": "XGBoost component",
+            "base_value": base,
+            "top_factors": factor_items[:SHAP_TOP_COUNT],
+            "total_features": len(features),
         }
 
-        except Exception as exc:
+    except HTTPException:
+        raise
+
+    except Exception as exc:
         logger.exception(
             "SHAP calculation failed: %s: %s",
             type(exc).__name__,
@@ -415,9 +441,16 @@ def explain(request: ExplainRequest):
                 "The AQI prediction is still available."
             ),
         )
+
     finally:
-        # Release request-specific explanation objects.
-        del explanation, explainer, shap_module
-        del X_raw, X_scaled, X_latest
+        # Do not clear the prediction or modify any trained model.
+        del explainer
+        del shap_values
+        del explanation
+        del raw_matrix
+        del scaled_matrix
+        del xgb_input
+        del values
+        del base_value
         gc.collect()
         shap_lock.release()

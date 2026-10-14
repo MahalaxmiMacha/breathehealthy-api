@@ -44,8 +44,12 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Allow frontend requests. Restrict origins to your frontend domain
-# if you later need stricter production CORS settings.
+# -------------------------------------------------------------------
+# CORS configuration
+# Allows the production Base44 frontend and HTTPS Base44 subdomains.
+# Credentials are disabled because this API uses no cookie-based auth.
+# -------------------------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -53,8 +57,9 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
     ],
+    allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)*base44\.app$",
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -76,12 +81,18 @@ try:
     scaler = joblib.load(MODEL_DIR / "scaler_final.pkl")
     meta_model = joblib.load(MODEL_DIR / "meta_model_final.pkl")
 
-    with open(MODEL_DIR / "features_final.json", "r", encoding="utf-8") as f:
+    with open(
+        MODEL_DIR / "features_final.json",
+        "r",
+        encoding="utf-8",
+    ) as f:
         features = json.load(f)
 
     if isinstance(features, dict):
-        # Supports JSON saved as {"features": [...]}.
-        features = features.get("features", features.get("feature_names"))
+        features = features.get(
+            "features",
+            features.get("feature_names"),
+        )
 
     if not isinstance(features, list):
         raise ValueError(
@@ -97,7 +108,9 @@ try:
         )
 
     if len(set(features)) != len(features):
-        raise ValueError("features_final.json contains duplicate feature names.")
+        raise ValueError(
+            "features_final.json contains duplicate feature names."
+        )
 
     logger.info(
         "Models loaded. Features=%d, sequence=%d",
@@ -122,7 +135,9 @@ class PredictionRequest(BaseModel):
         ...,
         min_length=SEQUENCE_LENGTH,
         max_length=SEQUENCE_LENGTH,
-        description="Exactly 24 chronological records containing model features",
+        description=(
+            "Exactly 24 chronological records containing model features"
+        ),
     )
 
 
@@ -172,7 +187,10 @@ def prepare_row(record: dict[str, Any]) -> np.ndarray:
 def prepare_records(records: list[dict[str, Any]]) -> np.ndarray:
     """Convert records to a 2-D array in the trained feature order."""
     if not records:
-        raise HTTPException(status_code=422, detail="No records were provided.")
+        raise HTTPException(
+            status_code=422,
+            detail="No records were provided.",
+        )
 
     rows = [prepare_row(record) for record in records]
     matrix = np.stack(rows, axis=0)
@@ -259,14 +277,22 @@ def run_prediction(records: list[dict[str, Any]]) -> dict[str, Any]:
         ).reshape(-1)
 
         if final_output.size == 0:
-            raise ValueError("The meta-model returned an empty prediction.")
+            raise ValueError(
+                "The meta-model returned an empty prediction."
+            )
 
         final_prediction = float(final_output[0])
 
         if not np.isfinite(
-            [lstm_prediction, xgb_prediction, final_prediction]
+            [
+                lstm_prediction,
+                xgb_prediction,
+                final_prediction,
+            ]
         ).all():
-            raise ValueError("A model returned a non-finite prediction.")
+            raise ValueError(
+                "A model returned a non-finite prediction."
+            )
 
         return {
             "prediction": final_prediction,
@@ -343,7 +369,6 @@ def explain(request: ExplainRequest):
         )
 
     explainer = None
-    shap_values = None
     explanation = None
     raw_matrix = None
     scaled_matrix = None
@@ -390,9 +415,8 @@ def explain(request: ExplainRequest):
             raise ValueError("SHAP returned non-finite values.")
 
         # Report original feature values for readability.
-        latest_record = request.records[-1]
-
         factor_items = []
+
         for index, feature in enumerate(features):
             shap_value = float(values[index])
             raw_value = float(raw_matrix[-1, index])
@@ -443,9 +467,7 @@ def explain(request: ExplainRequest):
         )
 
     finally:
-        # Do not clear the prediction or modify any trained model.
         del explainer
-        del shap_values
         del explanation
         del raw_matrix
         del scaled_matrix

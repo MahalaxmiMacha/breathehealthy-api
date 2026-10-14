@@ -41,13 +41,11 @@ SHAP_TOP_COUNT = 10
 app = FastAPI(
     title="BreatheHealthy API",
     description="Hybrid air-quality forecasting and explainability API",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 # -------------------------------------------------------------------
 # CORS configuration
-# Allows the production Base44 frontend and HTTPS Base44 subdomains.
-# Credentials are disabled because this API uses no cookie-based auth.
 # -------------------------------------------------------------------
 
 app.add_middleware(
@@ -64,7 +62,7 @@ app.add_middleware(
 )
 
 # -------------------------------------------------------------------
-# Load the already-trained models. Do not retrain them here.
+# Load existing trained models. No training occurs here.
 # -------------------------------------------------------------------
 
 logger.info("Loading BreatheHealthy models...")
@@ -104,7 +102,7 @@ try:
     if len(features) != EXPECTED_FEATURE_COUNT:
         raise ValueError(
             f"Expected {EXPECTED_FEATURE_COUNT} features, "
-            f"but features_final.json contains {len(features)}."
+            f"but found {len(features)}."
         )
 
     if len(set(features)) != len(features):
@@ -119,12 +117,11 @@ try:
     )
 
 except Exception:
-    logger.exception("Failed to load one or more model files.")
+    logger.exception("Failed to load model files.")
     raise
 
-# Only one SHAP request may run at a time on this small instance.
-shap_lock = threading.Lock()
-shap_explainer = None
+# Prevent simultaneous explanation calculations on the small instance.
+explain_lock = threading.Lock()
 
 # -------------------------------------------------------------------
 # Request models
@@ -135,9 +132,7 @@ class PredictionRequest(BaseModel):
         ...,
         min_length=SEQUENCE_LENGTH,
         max_length=SEQUENCE_LENGTH,
-        description=(
-            "Exactly 24 chronological records containing model features"
-        ),
+        description="Exactly 24 chronological records",
     )
 
 
@@ -155,7 +150,7 @@ class ExplainRequest(BaseModel):
 # -------------------------------------------------------------------
 
 def prepare_row(record: dict[str, Any]) -> np.ndarray:
-    """Convert one record into the exact feature order used for training."""
+    """Read features in exactly the order used during training."""
     values = []
 
     for feature in features:
@@ -176,7 +171,7 @@ def prepare_row(record: dict[str, Any]) -> np.ndarray:
         if not np.isfinite(value):
             raise HTTPException(
                 status_code=422,
-                detail=f"Feature '{feature}' must be a finite number.",
+                detail=f"Feature '{feature}' must be finite.",
             )
 
         values.append(value)
@@ -185,27 +180,29 @@ def prepare_row(record: dict[str, Any]) -> np.ndarray:
 
 
 def prepare_records(records: list[dict[str, Any]]) -> np.ndarray:
-    """Convert records to a 2-D array in the trained feature order."""
+    """Convert records into a 2-D array in training feature order."""
     if not records:
         raise HTTPException(
             status_code=422,
             detail="No records were provided.",
         )
 
-    rows = [prepare_row(record) for record in records]
-    matrix = np.stack(rows, axis=0)
+    matrix = np.stack(
+        [prepare_row(record) for record in records],
+        axis=0,
+    )
 
     if matrix.shape[1] != EXPECTED_FEATURE_COUNT:
         raise HTTPException(
             status_code=422,
-            detail=f"Expected {EXPECTED_FEATURE_COUNT} features per record.",
+            detail=f"Expected {EXPECTED_FEATURE_COUNT} features.",
         )
 
     return matrix
 
 
 def scale_matrix(matrix: np.ndarray) -> np.ndarray:
-    """Apply the existing fitted scaler without fitting or retraining."""
+    """Use the saved scaler; never fit or retrain it."""
     try:
         scaled = scaler.transform(matrix)
     except Exception as exc:
@@ -213,14 +210,14 @@ def scale_matrix(matrix: np.ndarray) -> np.ndarray:
         raise HTTPException(
             status_code=422,
             detail=f"Feature scaling failed: {type(exc).__name__}.",
-        )
+        ) from exc
 
     scaled = np.asarray(scaled, dtype=np.float32)
 
     if not np.isfinite(scaled).all():
         raise HTTPException(
             status_code=422,
-            detail="Scaled feature values contain invalid numbers.",
+            detail="Scaled features contain invalid numbers.",
         )
 
     return scaled
@@ -242,31 +239,30 @@ def run_prediction(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     scaled_matrix = scale_matrix(raw_matrix)
 
-    # LSTM input shape: (batch, sequence length, feature count).
-    lstm_input = scaled_matrix.reshape(
-        1,
-        SEQUENCE_LENGTH,
-        EXPECTED_FEATURE_COUNT,
-    )
-
     try:
+        lstm_input = scaled_matrix.reshape(
+            1,
+            SEQUENCE_LENGTH,
+            EXPECTED_FEATURE_COUNT,
+        )
+
         lstm_output = np.asarray(
             lstm_model.predict(lstm_input, verbose=0)
         ).reshape(-1)
 
-        # XGBoost uses the most recent time step.
+        # XGBoost uses the latest time step.
         xgb_input = scaled_matrix[-1:, :]
         xgb_output = np.asarray(
             xgb_model.predict(xgb_input)
         ).reshape(-1)
 
         if lstm_output.size == 0 or xgb_output.size == 0:
-            raise ValueError("A model returned an empty prediction.")
+            raise ValueError("A base model returned no prediction.")
 
         lstm_prediction = float(lstm_output[0])
         xgb_prediction = float(xgb_output[0])
 
-        # Meta-model combines the two base-model predictions.
+        # Preserve the original meta-model input order.
         meta_input = np.asarray(
             [[lstm_prediction, xgb_prediction]],
             dtype=np.float32,
@@ -277,22 +273,14 @@ def run_prediction(records: list[dict[str, Any]]) -> dict[str, Any]:
         ).reshape(-1)
 
         if final_output.size == 0:
-            raise ValueError(
-                "The meta-model returned an empty prediction."
-            )
+            raise ValueError("The meta-model returned no prediction.")
 
         final_prediction = float(final_output[0])
 
         if not np.isfinite(
-            [
-                lstm_prediction,
-                xgb_prediction,
-                final_prediction,
-            ]
+            [lstm_prediction, xgb_prediction, final_prediction]
         ).all():
-            raise ValueError(
-                "A model returned a non-finite prediction."
-            )
+            raise ValueError("A model returned a non-finite prediction.")
 
         return {
             "prediction": final_prediction,
@@ -309,7 +297,7 @@ def run_prediction(records: list[dict[str, Any]]) -> dict[str, Any]:
         raise HTTPException(
             status_code=500,
             detail=f"Prediction failed: {type(exc).__name__}.",
-        )
+        ) from exc
     finally:
         gc.collect()
 
@@ -329,7 +317,6 @@ def root():
 
 @app.get("/health")
 def health():
-    # Do not import SHAP here: health checks should remain lightweight.
     return {
         "status": "healthy",
         "models": {
@@ -337,7 +324,7 @@ def health():
             "xgboost": "loaded",
             "scaler": "loaded",
             "meta_model": "loaded",
-            "shap": "loaded on demand",
+            "explanation": "native XGBoost contributions",
         },
         "features": len(features),
         "sequence_length": SEQUENCE_LENGTH,
@@ -354,125 +341,122 @@ def predict(request: PredictionRequest):
 
 
 # -------------------------------------------------------------------
-# SHAP explanation endpoint
+# Explanation endpoint
+# Uses XGBoost native feature contributions instead of shap.TreeExplainer.
+# No standalone SHAP import or explainer initialization is required.
 # -------------------------------------------------------------------
 
 @app.post("/explain")
 def explain(request: ExplainRequest):
-    global shap_explainer
-
-    # Never queue multiple memory-heavy SHAP requests on the free instance.
-    if not shap_lock.acquire(blocking=False):
+    if not explain_lock.acquire(blocking=False):
         raise HTTPException(
             status_code=503,
-            detail="SHAP explanation is busy. Please try again shortly.",
+            detail="An explanation is already running. Please try again.",
         )
 
-    explainer = None
-    explanation = None
     raw_matrix = None
     scaled_matrix = None
-    xgb_input = None
-    values = None
-    base_value = None
+    dmatrix = None
+    contributions = None
 
     try:
-        # The frontend may send just the latest record.
         raw_matrix = prepare_records(request.records)
         scaled_matrix = scale_matrix(raw_matrix)
-        xgb_input = scaled_matrix[-1:, :]
 
-        # Import SHAP only when an explanation is requested.
-        import shap
+        # Explain the latest record, using the same scaled features
+        # supplied to the XGBoost component during prediction.
+        latest_scaled_row = scaled_matrix[-1:, :]
 
-        if shap_explainer is None:
-            logger.info("Creating SHAP TreeExplainer on demand.")
-            shap_explainer = shap.TreeExplainer(xgb_model)
+        # Native XGBoost TreeSHAP contributions. The last element
+        # is the bias/base contribution; preceding elements map to
+        # the trained input features.
+        dmatrix = xgb.DMatrix(latest_scaled_row)
 
-        explainer = shap_explainer
-        explanation = explainer(xgb_input)
+        contributions = xgb_model.get_booster().predict(
+            dmatrix,
+            pred_contribs=True,
+        )
 
-        values = np.asarray(explanation.values)
+        contributions = np.asarray(contributions)
 
-        # Normalize common SHAP output shapes for one-row regression.
-        if values.ndim == 3:
-            values = values[0, :, 0]
-        elif values.ndim == 2:
-            values = values[0]
-
-        values = np.asarray(values).reshape(-1)
-
-        if values.size != len(features):
+        # For a single-row regression model, expected shape is
+        # (1, feature_count + 1).
+        if contributions.ndim != 2 or contributions.shape[0] != 1:
             raise ValueError(
-                f"SHAP returned {values.size} values for "
-                f"{len(features)} features."
+                f"Unexpected contribution shape: {contributions.shape}"
             )
 
-        base_value = np.asarray(explanation.base_values).reshape(-1)
-        base = float(base_value[0]) if base_value.size else 0.0
+        row_contributions = contributions[0]
 
-        if not np.isfinite(values).all() or not np.isfinite(base):
-            raise ValueError("SHAP returned non-finite values.")
+        if row_contributions.size != len(features) + 1:
+            raise ValueError(
+                "XGBoost contribution count does not match "
+                "the feature count plus the bias term."
+            )
 
-        # Report original feature values for readability.
-        factor_items = []
+        feature_contributions = row_contributions[:-1]
+        base_value = float(row_contributions[-1])
+
+        if (
+            not np.isfinite(feature_contributions).all()
+            or not np.isfinite(base_value)
+        ):
+            raise ValueError("XGBoost returned non-finite contributions.")
+
+        factors = []
 
         for index, feature in enumerate(features):
-            shap_value = float(values[index])
-            raw_value = float(raw_matrix[-1, index])
+            contribution = float(feature_contributions[index])
 
-            factor_items.append(
-                {
-                    "feature": feature,
-                    "value": raw_value,
-                    "shap_value": shap_value,
-                    "impact": (
-                        "increases prediction"
-                        if shap_value > 0
-                        else "decreases prediction"
-                        if shap_value < 0
-                        else "neutral"
-                    ),
-                }
-            )
+            if contribution > 1e-8:
+                impact = "increases"
+            elif contribution < -1e-8:
+                impact = "decreases"
+            else:
+                impact = "neutral"
 
-        factor_items.sort(
+            factors.append({
+                "feature": feature,
+                "value": float(raw_matrix[-1, index]),
+                "shap_value": contribution,
+                "impact": impact,
+            })
+
+        factors.sort(
             key=lambda item: abs(item["shap_value"]),
             reverse=True,
+        )
+
+        logger.info(
+            "Explanation calculated successfully for %d features.",
+            len(features),
         )
 
         return {
             "status": "success",
             "model": "XGBoost component",
-            "base_value": base,
-            "top_factors": factor_items[:SHAP_TOP_COUNT],
+            "explanation_method": "XGBoost native TreeSHAP contributions",
+            "base_value": base_value,
+            "top_factors": factors[:SHAP_TOP_COUNT],
             "total_features": len(features),
         }
 
     except HTTPException:
         raise
-
     except Exception as exc:
-        logger.exception(
-            "SHAP calculation failed: %s: %s",
-            type(exc).__name__,
-            str(exc),
-        )
+        logger.exception("Explanation calculation failed.")
         raise HTTPException(
             status_code=503,
             detail=(
-                f"SHAP explanation failed ({type(exc).__name__}). "
-                "The AQI prediction is still available."
+                f"Explanation failed ({type(exc).__name__}). "
+                "The AQI prediction endpoint is separate."
             ),
-        )
+        ) from exc
 
     finally:
-        del explainer
-        del explanation
-        del raw_matrix
-        del scaled_matrix
-        del xgb_input
-        del values
-        del base_value
+        raw_matrix = None
+        scaled_matrix = None
+        dmatrix = None
+        contributions = None
         gc.collect()
-        shap_lock.release()
+        explain_lock.release()
